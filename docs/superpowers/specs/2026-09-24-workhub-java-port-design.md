@@ -22,7 +22,7 @@
 
 ### 1.3 成功标准
 
-- Java 服务能顶替 workhub 现有职责：`tests/test_sequential.py` 的 35 个场景中实际端口 33 个（取舍见 9.2），全部通过。
+- Java 服务能顶替 workhub 现有职责：`tests/test_sequential.py` 的 35 个场景中实际端口 31 个（取舍见 9.2），全部通过。
 - 现场部署脚本、备份恢复流程照旧可用。
 - 客户端（员工机器上那份 `mcpServers` 配置）**不用改**就能连上。
 - 代码结构对**不熟悉 Python 的维护者**可读——这是本次的实质目标，也是选择"按领域重新分层"而非"逐模块直译"的原因。
@@ -286,6 +286,15 @@ public <T> T execute(Principal p, String operation, String requestId, Object par
 
 删除 `token_fingerprint` 后的收益：**`agent_credentials` 成为唯一凭据存储**。原 `auth.py:141-150` 是"先查 `agent_credentials`，查不到再拿 fingerprint 兜底"的双路径，此后只剩一条。
 
+### 6.1.1 连同删除的配置面
+
+删 legacy 会连带让两处配置失效，须一并清理，否则留下"配了但没人读"的死键：
+
+| 删除 | 依据 |
+|---|---|
+| `features.archive_to_weknora` 配置键 | 全仓库只有 `config.py:213-214` 读它，而那段代码**只做类型校验**（非 bool 则置 False），没有任何功能消费它。它是"终态归档到 WeKnora"这个从未落地的功能留下的占位，与 `work_items.archived` 是同一件事的两半——列已删，键不应独留 |
+| 环境变量 `WORKHUB_LEGACY_TIMEZONE` | 全仓库唯一读取点是 `app/migrate.py:46`，即迁移过程解释老时间戳用的。`migrate.py` 整体不端口，该变量随之消失。`deploy/` 中无人设置它，故删除不影响部署脚本 |
+
 剩余 13 张表：`agent_profiles`、`agent_credentials`、`work_items`、`work_files`、`work_submissions`、`submission_files`、`draft_files`、`approval_steps`、`reviews`、`audit_logs`、`operation_requests`、`webhook_subs`、`delivery_logs`。
 
 ### 6.2 保留不动的三样
@@ -487,16 +496,24 @@ if url.host not in ("127.0.0.1","localhost") or not url.database.startswith("wor
 
 Java 侧：Testcontainers 起 `postgres:17-alpine`，每测试建 schema，DataSource 的 JDBC URL 携带 `?currentSchema=accept_xxx`。
 
-### 9.2 场景取舍：35 个中砍 2 留 33
+### 9.2 场景取舍：35 个中端口 31
 
-| 处置 | 场景 | 理由 |
+判据不是测试名，而是**它 import 谁**。文件里只有两种外部依赖：
+
+- `skills/workhub-mcp-connect/scripts/mcp_connect.py` —— 接入程序，属 skill 侧
+- `tests/fixtures/legacy_models.py` —— 迁移前的老表结构，已无对应数据
+
+| 处置 | 场景 | 依据 |
 |---|---|---|
-| 砍 | `test_migrate_legacy_preserves_data` | 测老数据迁移，无老数据 |
-| 砍 | `test_legacy_null_employee_id_can_complete_profile` | 测老档案空工号补填，同上 |
-| **保留** | `test_legacy_claim_entry_token_is_rejected` | 名字含 legacy 但测的是 `auth.py:116-120` 那段**活的行为**（配置残留废弃条目须明确报错） |
-| 待定 | `test_claim_reuses_legacy_server_name` | 从名称看测接入程序复用旧 MCP server 名，属 skill 侧。它在文件中的位置也支持这一判断：紧邻 `test_bootstrap_recovers_lost_registration_response`，同属接入/引导那一组（443–500 行），而真正的服务端场景在别处。实现时逐条过，该挪的挪去 skill 阶段 |
+| 砍 | `test_legacy_null_employee_id_can_complete_profile`（500 行） | import `fixtures/legacy_models.py`，测老档案空工号补填 |
+| 砍 | `test_migrate_legacy_preserves_data`（628 行） | 同上，测老数据迁移 |
+| **移 skill 阶段** | `test_bootstrap_recovers_lost_registration_response`（450 行） | import `mcp_connect.py`，测的是**接入程序**的"响应丢失后重跑"与待处理文件 `0o600`。它依赖的服务端性质（同工号重复登记同 token）已被 `test_registration_replay_and_duplicate`（118 行）与 `test_parallel_registration_does_not_reissue`（158 行）单独覆盖，故服务端侧无损失 |
+| **移 skill 阶段** | `test_claim_reuses_legacy_server_name`（476 行） | import `mcp_connect.py`，断言的是客户端 `mcp.json` 里 `mcpServers` 的**键名**（应沿用 `workhub-staff` 而非新建 `workhub`）。服务端根本没有"server 名"这个概念——那是客户端配置的键。此测试在 Java 服务端套件里**无法表达** |
+| **保留** | `test_legacy_claim_entry_token_is_rejected`（150 行） | 名字含 legacy 但**不** import 任何 fixture，测的是 `auth.py:116-120` 那段活的行为（配置残留废弃条目须明确报错），是纯服务端场景 |
 
-即服务端端口 **33 个**场景；若 `test_claim_reuses_legacy_server_name` 确认属 skill 侧，则为 32 个。
+由此文件可切成三段：服务端场景 98–448 行、接入/引导 450–498 行、legacy 与部署 500–668 行。**服务端端口 31 个场景**（35 − 2 砍 − 2 移）。
+
+移走的那 2 个不丢：它们属第 13.1 节的 skill 阶段，届时连同新写的引导流程一起重做。
 
 ### 9.3 不可省略的场景
 
@@ -527,7 +544,7 @@ Java 侧：Testcontainers 起 `postgres:17-alpine`，每测试建 schema，DataS
 - 命名卷而非 bind mount（macOS 上 PG 数据目录 bind mount 有属主与 fsync 语义问题）。
 - healthcheck 指向 `127.0.0.1` 而非 unix socket。
 - 日志 `max-size: 10m` 轮转（不轮转会写满宿主磁盘，而磁盘满时 PG 直接写不进去）。
-- `stop_grace_period: 30s`（上传上限 200MB，默认 10s 会截断在途请求）。
+- `stop_grace_period: 30s`。原注释写的理由是"上传上限 200MB，默认 10s 可能截断在途请求"——**200MB 是代码里的兜底默认值（`DEFAULT_MAX_SIZE_MB`），而实际投放的 `config.yaml` 把它收紧为 50MB**。两个数都对，只是分属两层：宽限期要按"最坏情况"给，所以引用默认值。**端口时两层都要保留**：常量仍是 200，`config.yaml` 仍写 50（见 10.5）。
 - `user: "${WORKHUB_UID:-10001}:${WORKHUB_GID:-10001}"`。
 
 **唯一变更是 `workhub` 服务的 `build`** 段。
@@ -571,7 +588,9 @@ java -jar app.jar maintenance deactivate E101 --reason '离职'
 - 运维文档与 README 指向它（"`registration.enabled` 是唯一开关"）
 - **文件内的注释本身是文档**——例如解释"MCP 白名单没配好会返回 421，但 REST 不受影响，很容易误判成服务没问题"
 
-**五条环境变量名不变**：`WORKHUB_TOKENS`、`WORKHUB_DATABASE_URL`、`WORKHUB_STORAGE_DIR`、`WORKHUB_BLOCK_PRIVATE_HOSTS`、`WORKHUB_MCP_ALLOWED_HOSTS`。
+**五条环境变量名不变**（不改成 `A2AHUB_*`——它们是部署契约，compose 与运维文档都按这些名字设值）：`WORKHUB_TOKENS`、`WORKHUB_DATABASE_URL`、`WORKHUB_STORAGE_DIR`、`WORKHUB_BLOCK_PRIVATE_HOSTS`、`WORKHUB_MCP_ALLOWED_HOSTS`。
+
+`upload.max_size_mb` 按现状保留 **50**，同时 Java 侧仍须保留 `200` 这个兜底默认值（见 10.1）。`features.archive_to_weknora` 与 `WORKHUB_LEGACY_TIMEZONE` 删除（见 6.1.1）。
 
 待实现细节：Spring 的配置绑定默认偏好 `workhub:` 前缀，而本文件使用顶层键。读取机制（`spring.config.additional-location` 或专用加载器）在实现早期确定，**约束是文件形状与上述五个环境变量名不得改变**。
 
@@ -582,7 +601,14 @@ java -jar app.jar maintenance deactivate E101 --reason '离职'
 - **数据库**：`utcnow()` → 带时区的 UTC
 - **webhook payload 的 `timestamp`**：`datetime.now().isoformat()` → **本地时间，不带时区**
 
-接收方拿到该时间戳无法判断时区。看似疏漏，但它是现状，且是给人看的字段。**按现状端口，本规格不作修改**，仅在此记录，以免后来者误以为它是 UTC。
+接收方拿到该时间戳无法判断时区。看似疏漏，但它是现状，且是给人看的字段。
+
+**决定：按现状端口，不改。** 两条理由：
+
+1. 改它等于改 webhook 的对外契约，而 webhook 可能指向第三方（钉钉或自建接收端）。这属于"顺手改进"，与本项目"与 workhub 一致优先"的取舍原则相冲突。
+2. 实际风险有限：部署恒定在单一时区（第 10.2 节的 `TZ=Asia/Shanghai`），故该时间戳恒为东八区本地时间，歧义被部署固定住了。
+
+仅在此记录，以免后来者误以为它是 UTC。**注意这与第 10.2 节的 tzdata 是同一条链**：若哪天有人删掉 Dockerfile 里的 tzdata，这个时间戳会静默退化为 UTC，而数据库里的时间不变——两边对不上，且没有任何报错。
 
 ---
 
@@ -594,7 +620,7 @@ java -jar app.jar maintenance deactivate E101 --reason '离职'
 |---|---|---|---|
 | 1 | 状态机由 7 处散落的 `_state()` 守卫收拢为显式转移表 | 可读性重构，行为不变（转移表逐条核实自原守卫） | 低 |
 | 2 | 审批链由抛异常改为 `ChainPlan` 返回值 | 控制流显式化，两条调用路径的语义不变 | 低 |
-| 3 | 删除 6 列 1 表（第 6.1 节） | 均为已死代码，逐列追溯过读取方 | 删列不可逆，已在评审中确认 |
+| 3 | 删除 6 列、1 表、2 处配置（第 6.1、6.1.1 节） | 均为已死代码，逐列逐键追溯过读取方 | 删列不可逆，已在评审中确认 |
 | 4 | 补 9 条 CHECK 约束（第 6.4 节） | 把注释中的取值搬进数据库 | 代码写越界值将由静默转为报错（故意） |
 | 5 | REST 错误信封统一为 `{code, message}` | 客户端可见 | 唯一消费方 `mcp_connect.py` 待重写 |
 | 6 | `delivery_logs.status` 由 3 值更正为 5 值 | **更正既有错误**，非设计改动 | 无（原注释是错的） |
@@ -650,7 +676,10 @@ skill 重写**不在本规格范围内**，将另起一份规格。本规格只�
 
 接入程序（`mcp_connect.py`，927 行，纯标准库 Python）的最终形态——是重写为 Java、还是保留 Python、还是改为 shell——属阶段 7 的决策，本规格不预设。
 
-已知的输入（供阶段 7 使用）：用户实测原版 skill 时，**初次引导卡了很久都未能真正开始**。根因分析需要用户回忆当时卡在哪一步，届时单独采集。
+已知的输入（供阶段 7 使用）：
+
+- 用户实测原版 skill 时，**初次引导卡了很久都未能真正开始**。根因分析需要用户回忆当时卡在哪一步，届时单独采集。
+- 第 9.2 节移出的 2 个场景——`test_bootstrap_recovers_lost_registration_response`（接入程序响应丢失后重跑，及待处理文件 `0o600`）与 `test_claim_reuses_legacy_server_name`（客户端 `mcp.json` 键名沿用）——归属这一阶段。它们全程不需要服务端改动。
 
 ---
 
