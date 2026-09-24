@@ -393,23 +393,83 @@ def review_work(work_id: str, submission_id: str, step_id: str,
 
 该判断正确且易被后来者"顺手补全"。Java 版将这段原样写成注释留在 `McpTools` 上，并且**不添加任何登记类工具**。
 
-### 7.5 Bearer 如何进入工具层
+### 7.5 Bearer 如何进入工具层（已查证定案）
 
-原实现用 contextvar（`principal_from_context()`），由 HTTP 中间件每请求填充。
+原实现用 contextvar（`principal_from_context()`），由中间件每请求填充。Java 无 contextvar。以下依据 **Spring AI 2.0.1 源码**，非文档推测。
 
-Java 无 contextvar。Spring AI 提供的机制是 `TransportContextExtractor`：从请求头取 `Authorization` 放入 `McpTransportContext`，工具内经 `McpSyncRequestContext.transportContext()` 取回。
+**第一段：传输层注入。必须自己声明 transport provider bean。**
 
-两条实现路径，**实现时先用最小验证确定**：
+```java
+@Bean
+WebMvcStreamableServerTransportProvider mcpTransport(
+        @Qualifier("mcpServerJsonMapper") JsonMapper jsonMapper,
+        ServerTransportSecurityValidator security) {
+    return WebMvcStreamableServerTransportProvider.builder()
+        .jsonMapper(new JacksonMcpJsonMapper(jsonMapper))
+        .mcpEndpoint("/mcp")
+        .securityValidator(security)                    // 见 7.6
+        .contextExtractor(req -> {
+            String auth = req.headers().firstHeader("Authorization");
+            Map<String, Object> md = new HashMap<>();   // Map.of 遇 null 会 NPE
+            if (auth != null) md.put("authorization", auth);
+            return McpTransportContext.create(md);
+        })
+        .build();
+}
+```
 
-- **首选**：用 Spring 的 `RequestContextHolder` 从当前请求取 header，封装 `IdentityResolver.current()`，工具签名保持干净。
-- **兜底**：工具方法挂 `McpSyncRequestContext` 参数。丑陋但必然可行。
+**这个 bean 不能省。** `McpServerStreamableHttpWebMvcAutoConfiguration` 从不设置 `contextExtractor`，而 builder 的默认值是 `serverRequest -> McpTransportContext.EMPTY`——开箱即用时每个工具拿到的都是空 context（spring-ai issue #4603）。该 bean 标了 `@ConditionalOnMissingBean`，自己声明即可覆盖；但**必须把自动配置的 `.jsonMapper(...)` 与 `.mcpEndpoint(...)` 一并抄来**，否则 MCP 消息序列化会坏。`req` 的类型是 `org.springframework.web.servlet.function.ServerRequest`。
 
-**待确认**：该附加参数是否会出现在对客户端可见的 schema 中。若会，则首选方案不是"更好"而是"必须"。
+**第二段：工具层读取。用一个末尾的 `ToolContext` 参数。**
 
-### 7.6 两个兼容点
+```java
+@Tool(description = "…")
+public String reviewWork(@ToolParam(description = "…") String workId, /* …业务参数… */
+                         ToolContext ctx) {
+    McpSyncServerExchange ex = McpToolUtils.getMcpExchange(ctx).orElseThrow();
+    String authorization = (String) ex.transportContext().get("authorization");
+    …
+}
+```
 
-- **`/mcp` 与 `/mcp/` 都须可连**。原实现 `streamable_http_path="/"` 挂载在 `/mcp`，实际路径带尾斜杠；README 声明两者兼容。Spring AI 侧配置 `mcp-endpoint` 后需额外处理尾斜杠。
-- **DNS 重绑定防护**。原实现为 `TransportSecuritySettings(allowed_hosts=CFG["mcp"]["allowed_hosts"])`，白名单来自配置，只支持精确主机名或 `主机名:*`，不支持全局 `*`。Spring AI 侧对应机制须确认，**不得默认放开**。
+**参数类型只能是 `ToolContext`，绝不能用 `McpSyncRequestContext`。** 已查证 `JsonSchemaGenerator.generateForMethodInput` 只跳过 `ToolContext` 一种类型（源码注释即"not included in the JSON Schema generation"）；`McpSyncRequestContext` 与 `McpTransportContext` **既不会被排除出对客户端可见的 schema，也不会被注入**——它们会作为普通业务参数出现在 `tools/list` 里，并被拿去模型的 JSON 参数里取值。
+
+因此原拟的"兜底方案"不是丑陋，而是**错的**。`ToolContext` 对客户端完全不可见，故 20 个工具的签名仍然只有业务参数 + 这个尾参，与 Python 契约一一对应。
+
+**不用 `RequestContextHolder`。** 无官方文档或测试支持；社区 issue（#2757 报告在 `@Tool` 内取到 null、#5374 问同一件事且未获维护者答复）都指向不可靠。即便在当前"同步 + streamable + WebMVC"组合下大概率能跑，它也会在切到 `ASYNC`、WebFlux 或任何线程切换时静默失效。**上面那条不是首选，是唯一可行路径。**
+
+### 7.6 两个兼容点（已查证）
+
+**① 尾斜杠必须自己补。** `/mcp` 可用，`/mcp/` 返回 **404**（不是 405）。传输层以精确 PathPattern 注册 GET/POST/DELETE，而自 Spring Framework 6.0 起 `matchOptionalTrailingSeparator` 默认为 false，**到 Spring Framework 7.0（Boot 4.1.1 所用）连 `setMatchOptionalTrailingSeparator` 与 `setUseTrailingSlashMatch` 两个方法都已删除**；MCP 与 Spring AI 都没有对应属性。
+
+README 承诺两种写法都能连，故用 Spring Framework 的 `UrlHandlerFilter` 补上：
+
+```java
+@Bean
+FilterRegistrationBean<UrlHandlerFilter> mcpTrailingSlash() {
+    var filter = UrlHandlerFilter.trailingSlashHandler("/mcp")
+            .wrapRequest()               // 工具是 POST，不能用 redirect
+            .build();
+    var reg = new FilterRegistrationBean<>(filter);
+    reg.setOrder(Ordered.HIGHEST_PRECEDENCE);
+    return reg;                          // 只挂 /mcp，不要 /**
+}
+```
+
+**② DNS 重绑定防护必须手工接，且默认是关的。** MCP Java SDK 2.0.0（Spring AI 2.0.1 锁定）里有与 Python `TransportSecuritySettings` 对应的实现，但**传输层 builder 的默认值是 `ServerTransportSecurityValidator.NOOP`——即全部放行**，自动配置也不设置它。必须显式声明：
+
+```java
+@Bean
+ServerTransportSecurityValidator mcpSecurity(McpSecurityProperties props) {
+    var b = DefaultServerTransportSecurityValidator.builder();
+    props.allowedHosts().forEach(b::allowedHost);   // 精确主机名，或 主机名:*
+    return b.build();
+}
+```
+
+它校验 `Host` 头，不在白名单则 **421**（与 Python 行为一致），`Origin` 非法则 403。
+
+白名单仍来自 `mcp.allowed_hosts`，**并且必须保留原 `_normalize_mcp_hosts` 的那条校验**（`config.py:159-164`）：任何 `*` 只要不是 `:*` 结尾就直接报错。不要因为换了语言就放宽成接受全局 `*`——那会让白名单失去意义。
 
 ---
 
@@ -592,6 +652,16 @@ java -jar app.jar maintenance deactivate E101 --reason '离职'
 
 `upload.max_size_mb` 按现状保留 **50**，同时 Java 侧仍须保留 `200` 这个兜底默认值（见 10.1）。`features.archive_to_weknora` 与 `WORKHUB_LEGACY_TIMEZONE` 删除（见 6.1.1）。
 
+**`database_url` 必须翻译，不能直读。** 投放的 `config.yaml` 与 compose 注入的都是 SQLAlchemy 写法（`postgresql+psycopg://workhub:workhub@127.0.0.1:5432/workhub`），而 Java 数据源要 `jdbc:postgresql://…`。原 `config.py` 本就有 `_DIALECT_ALIASES` 在做归一化，接受 `postgres://`（Heroku 风格）、`postgresql://`、`postgresql+psycopg://` 三种。既然配置契约不变，**Java 侧就接下这段翻译**：入参接受这三种写法，转成 JDBC 形式再交给数据源。
+
+不要把 `config.yaml` 里的值直接改成 `jdbc:` 形式了事——那会破坏"同一份配置在本地与内网共用"的现状，也和环境变量覆盖路径冲突（compose 注入的同样是 SQLAlchemy 写法）。
+
+**`server.port` 是僵尸键，不要实现。** 原 `load_config` 显式做了 `server.pop("port", None)`，注释写明它"看着像能用、改了不生效"——绑定地址由启动命令决定，该键只曾喂给一条提示性告警。Java 侧同样不得读它，否则会凭空造出一个新的僵尸配置项。
+
+**布尔环境变量的取值集合要照搬。** `WORKHUB_BLOCK_PRIVATE_HOSTS` 认 `1/true/yes/on` 与 `0/false/no/off`（`config.py` 的 `_BOOL_TRUE` / `_BOOL_FALSE`），不是只认 `true`/`false`。非法值的行为也要一致。
+
+**配置加载失败要快速失败并指出文件与键。** 原 `config.py` 把 `load_config()` 包在 try/except 里（`config.py:243-246`），失败时给的是"哪个文件、哪个键"，而不是一段无上下文的启动堆栈。Java 侧对应为启动即失败 + 明确报出键名。
+
 待实现细节：Spring 的配置绑定默认偏好 `workhub:` 前缀，而本文件使用顶层键。读取机制（`spring.config.additional-location` 或专用加载器）在实现早期确定，**约束是文件形状与上述五个环境变量名不得改变**。
 
 ### 10.6 时间戳的不一致（记录在案）
@@ -640,16 +710,27 @@ java -jar app.jar maintenance deactivate E101 --reason '离职'
 
 ## 12. 风险与待验证点
 
-按优先级排列，**均需在实现早期解决**：
+### 12.1 已定案（查 Spring AI 2.0.1 源码得出，非文档推测）
+
+| # | 项 | 结论 |
+|---|---|---|
+| 1 | MCP 工具如何取得 Bearer | `contextExtractor` 注入 + 工具尾部 `ToolContext` 参数读回（7.5） |
+| 3 | 附加参数是否泄漏进客户端可见 schema | **会泄漏。** 只有 `ToolContext` 被 `JsonSchemaGenerator` 跳过；`McpSyncRequestContext` / `McpTransportContext` 会进 `tools/list` 并被当业务参数取值——故**不能用**（7.5） |
+| 4 | DNS 重绑定防护 | `DefaultServerTransportSecurityValidator`；**builder 默认是 NOOP（全放行）**，必须手工接（7.6） |
+| 5 | `/mcp/` 尾斜杠 | Spring Framework 7.0 已彻底删除尾斜杠匹配，用 `UrlHandlerFilter.wrapRequest()` 补（7.6） |
+
+### 12.2 未决（实现早期验证）
 
 | # | 风险 | 验证方式 | 退路 |
 |---|---|---|---|
-| 1 | MCP 工具如何取得 Bearer（第 7.5 节） | 20 行最小验证 | 工具方法挂 `McpSyncRequestContext` 参数 |
-| 2 | 测试的 schema-per-test 与 Spring 测试上下文缓存冲突（第 9.1 节） | 写第一个集成测试时验证 | 改为顺序执行 + 测试间 `TRUNCATE` |
-| 3 | 附加的 transport context 参数是否泄漏进对客户端可见的 schema | 拉取 `/mcp` 的 tools/list 对比 | 若无泄漏则首选方案可用；否则必须用 `RequestContextHolder` |
-| 4 | Spring AI 侧的 DNS 重绑定防护对应机制（第 7.6 节） | 查 Spring AI 配置项 | 自定义 Host 头校验过滤器 |
-| 5 | `/mcp/` 尾斜杠兼容（第 7.6 节） | 两种路径各发一次 initialize | 加一个路径转发 |
-| 6 | `config.yaml` 顶层键绑定（第 10.5 节） | 写配置绑定类时验证 | 专用加载器（如原 `config.py` 的做法） |
+| 2 | 测试的 schema-per-test 与 Spring 测试上下文缓存冲突（9.1） | 写第一个集成测试时验证 | 改为顺序执行 + 测试间 `TRUNCATE` |
+| 6 | `config.yaml` 顶层键绑定（10.5） | 写配置绑定类时验证 | 专用加载器（如原 `config.py` 的做法） |
+
+### 12.3 本轮查证带来的一处新脆弱点
+
+自己声明 transport provider 会**覆盖**自动配置（`@ConditionalOnMissingBean`），所以 `.jsonMapper(...)` 与 `.mcpEndpoint(...)` 必须手动抄全。抄漏任何一处，MCP 消息序列化或端点路径就会坏，而症状不会指向根因——这正是 spring-ai issue #4603 那类问题的形态。
+
+**对策**：把 transport provider 的装配放进第 0 阶段，用一个真发 HTTP 的 `initialize` 测试盖住它（对齐原 `test_real_mcp_http_and_process_restart` 的做法），不要等到第 5 阶段接工具时才发现。
 
 ---
 
@@ -659,12 +740,12 @@ java -jar app.jar maintenance deactivate E101 --reason '离职'
 
 | 阶段 | 内容 | 完成标志 |
 |---|---|---|
-| 0 | 骨架：pom 依赖、Flyway `V1__baseline.sql`、配置绑定、错误体系、`/api/health` 与 `/api/ready` | 空库启动建表成功，健康检查通过 |
+| 0 | 骨架：pom 依赖、Flyway `V1__baseline.sql`、配置绑定、错误体系、`/api/health` 与 `/api/ready`；**MCP transport provider 装配**（7.5/7.6 的 bean 与安全校验），并用真发 HTTP 的 `initialize` 测试盖住它 | 空库启动建表成功，健康检查通过；`/mcp` 与 `/mcp/` 都能完成 initialize，Host 头不在白名单时返回 421 |
 | 1 | 身份：`identity` + 凭据 + 登记 + 鉴权 | 登记幂等、并发登记、角色与上级校验的测试通过 |
 | 2 | 工作项与审批：`work` 核心、状态机、审批链、幂等闸门 | 三级流转、并发审批、撤回返工测试通过 |
 | 3 | 附件：存储、上传、读取、下载 | 原子写、扩展名白名单、路径逃逸防护测试通过 |
 | 4 | 通知：outbox、租约、重试、SSRF 防护、两个渠道 | 原子性、租约过期接管、重试梯度测试通过 |
-| 5 | 两个入口：REST + MCP 适配器 | 29 条路由与 20 个工具行为一致；真 MCP HTTP 测试通过 |
+| 5 | 两个入口：REST 控制器 + 20 个 MCP 工具类（transport 已在阶段 0 装好） | 29 条路由与 20 个工具行为一致 |
 | 6 | 部署收口：Dockerfile、compose、`deploy.sh`、运维命令 | 备份恢复演练、进程重启测试通过 |
 | 7 | **（独立规格）** skill 重写 | 见下 |
 
