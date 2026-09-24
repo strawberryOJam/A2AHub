@@ -68,6 +68,33 @@
 - 传输层默认**不鉴权**，与 workhub 现有行为一致（认证在工具层）。这是有意保持，不是疏漏。
 - 工具声明用 `@Tool` + `MethodToolCallbackProvider`。
 
+### 2.2 依赖坐标（已实测，非文档推断）
+
+以下坐标由真实 Maven 构建验证（Spring Boot 4.1.1 + Java 21），**声明时一律不写 `<version>`**，全部由父 POM 管理。
+
+| 用途 | 坐标 | 解析版本 |
+|---|---|---|
+| MVC | `spring-boot-starter-webmvc` | 4.1.1 |
+| JDBC | `spring-boot-starter-jdbc` | 4.1.1（带 HikariCP 7.0.2） |
+| 迁移 | `org.flywaydb:flyway-core` | 12.4.0 |
+| 迁移（PG 方言） | `org.flywaydb:flyway-database-postgresql` | 12.4.0 |
+| 驱动 | `org.postgresql:postgresql` | 42.7.13 |
+| MCP | `org.springframework.ai:spring-ai-starter-mcp-server-webmvc` | 2.0.1（需引 `spring-ai-bom`） |
+| 测试容器核心 | `org.testcontainers:testcontainers` | 2.0.5 |
+| 测试容器 PG | `org.testcontainers:testcontainers-postgresql` | 2.0.5 |
+| 测试容器 JUnit5 | `org.testcontainers:testcontainers-junit-jupiter` | 2.0.5 |
+| 测试容器装配 | `org.springframework.boot:spring-boot-testcontainers` | 4.1.1 |
+
+**两条实测踩到的坑：**
+
+**① Testcontainers 2.0 把模块 artifactId 全加了 `testcontainers-` 前缀。** `org.testcontainers:postgresql` 与 `org.testcontainers:junit-jupiter` 这两个旧名字**不在 BOM 里**，声明的后果是构建在 POM 校验阶段就失败（`'dependencies.dependency.version' … is missing`），而不是运行时才发现。必须写 `testcontainers-postgresql` / `testcontainers-junit-jupiter`。
+
+**② Jackson 3 的根包是 `tools.jackson`，不是 `com.fasterxml.jackson`。** `ObjectMapper` 在 `tools.jackson.databind.ObjectMapper`，`JsonMapper` 在 `tools.jackson.databind.json.JsonMapper`；artifact 是 `tools.jackson.core:jackson-databind:3.1.5`，由 `spring-boot-starter-webmvc` 传递带入，无需显式声明。**但注解没有搬**——`@JsonProperty`、`@JsonInclude` 仍在 `com.fasterxml.jackson.annotation`。
+
+**③ `ObjectMapper` 在 Jackson 3 里变成不可变的。** `configure()` / `enable()` / `disable()` / `registerModule()` 全部从 `ObjectMapper` 上消失，配置只能经 builder：`JsonMapper.builder().enable(…).build()`。且 `SerializationFeature` 与 `MapperFeature` 有删项（如 `WRITE_DATES_AS_TIMESTAMPS` 已移除）。规范序列化要用的 `ORDER_MAP_ENTRIES_BY_KEYS` 与 `SORT_PROPERTIES_ALPHABETICALLY` 都还在。
+
+**④ `spring-boot-starter-web` 仍发布但已废弃**，POM 描述明写 deprecated in favor of `spring-boot-starter-webmvc`。用后者。
+
 参考：
 - <https://docs.spring.io/spring-ai/reference/api/mcp/mcp-server-boot-starter-docs.html>
 - <https://docs.spring.io/spring-ai/reference/api/mcp/mcp-streamable-http-server-boot-starter-docs.html>
@@ -247,6 +274,10 @@ public <T> T execute(Principal p, String operation, String requestId, Object par
 `handler` 必须运行在同一事务内（`TransactionTemplate`）。
 
 一处自然简化：原实现在重读 profile 时用了 `populate_existing=True` 以打穿 SQLAlchemy 的 identity map 缓存（`idempotency.py:31`）。`JdbcClient` 无 identity map，该问题自动消失。
+
+**另一处简化（重要）：`canonical()` 不必与 Python 逐字节一致。** 哈希只用于同一次请求的重放比对，而比对的另一端永远是本服务自己写进 `operation_requests.request_hash` 的值。既然数据库清空重来、没有 Python 时代的哈希残留，Java 的规范化只需在**自身内部**确定且稳定即可——不必复刻 Python 的 `sort_keys=True, separators=(",", ":")` 字节序列。
+
+这消掉了一整类风险（Jackson 3 与 Python json 在浮点、Unicode 转义、时间格式上的差异都不再要紧），代价是必须保证**同一输入永远产生同一字节序列**：map 键排序开启、不缩进、时间类型显式固定格式。注意 Jackson 3 已移除 `WRITE_DATES_AS_TIMESTAMPS`（见 2.2），时间序列化需显式配置而非依赖默认值。
 
 ### 5.4 并发控制
 
@@ -662,7 +693,22 @@ java -jar app.jar maintenance deactivate E101 --reason '离职'
 
 **配置加载失败要快速失败并指出文件与键。** 原 `config.py` 把 `load_config()` 包在 try/except 里（`config.py:243-246`），失败时给的是"哪个文件、哪个键"，而不是一段无上下文的启动堆栈。Java 侧对应为启动即失败 + 明确报出键名。
 
-待实现细节：Spring 的配置绑定默认偏好 `workhub:` 前缀，而本文件使用顶层键。读取机制（`spring.config.additional-location` 或专用加载器）在实现早期确定，**约束是文件形状与上述五个环境变量名不得改变**。
+**读取机制：自己写加载器，不用 Spring 的配置绑定。**
+
+已实测两条路都能走通：
+
+- `spring.config.additional-location` 指向外部 YAML 时，**任意顶层键都能被读进 Environment**（不限于 `spring.*`）。
+- `@ConfigurationProperties(prefix = "")` 能绑定整个根，且 `database_url` → `databaseUrl` 的宽松绑定有效。
+
+但**仍然选择自己写加载器**，理由是这条更贴近原实现、也更可控：
+
+1. 原 `config.py` 本就有大量归一化逻辑必须逐条复现——环境变量优先级、SQLAlchemy→JDBC 的连接串翻译、布尔取值集合、`mcp.allowed_hosts` 的 `*` 校验、相对 `storage_dir` 锚到仓库根、空键（`server:` 解析成 null）归一化、以及"失败时指出哪个文件哪个键"。这些都无处可省，写成绑定注解反而把它们拆散到注解与校验器两处。
+2. 空前缀 `@ConfigurationProperties` 虽然实测可行，**但官方文档并未承认**——文档明写 prefix "must be in kebab case"，只文档化了无前缀时的 bean 命名。依赖未文档化的默认行为不是好交换。
+3. 自写加载器可产出**不可变 record**，与 §4.3 的取舍一致。
+
+**一条必须记住的实测结论**：宽松绑定**只在 `@ConfigurationProperties` 内生效**。`@Value("${databaseUrl}")` 与 `environment.getProperty("databaseUrl")` **都取不到** `database_url` 这个键——实测前者返回 null。既然不用绑定注解，就需要精确键名读取，或干脆全走自己的加载器。另外 `@PropertySource` **无法加载 YAML**（官方明确说明），不要往这条路上设计。
+
+**约束不变**：配置文件的形状、键名、以及上述五个环境变量名都不得改变。
 
 ### 10.6 时间戳的不一致（记录在案）
 
@@ -719,12 +765,13 @@ java -jar app.jar maintenance deactivate E101 --reason '离职'
 | 4 | DNS 重绑定防护 | `DefaultServerTransportSecurityValidator`；**builder 默认是 NOOP（全放行）**，必须手工接（7.6） |
 | 5 | `/mcp/` 尾斜杠 | Spring Framework 7.0 已彻底删除尾斜杠匹配，用 `UrlHandlerFilter.wrapRequest()` 补（7.6） |
 
-### 12.2 未决（实现早期验证）
+### 12.2 未决（只剩一项）
 
 | # | 风险 | 验证方式 | 退路 |
 |---|---|---|---|
 | 2 | 测试的 schema-per-test 与 Spring 测试上下文缓存冲突（9.1） | 写第一个集成测试时验证 | 改为顺序执行 + 测试间 `TRUNCATE` |
-| 6 | `config.yaml` 顶层键绑定（10.5） | 写配置绑定类时验证 | 专用加载器（如原 `config.py` 的做法） |
+
+第 6 项（`config.yaml` 顶层键绑定）已定案：自写加载器，见 10.5。
 
 ### 12.3 本轮查证带来的一处新脆弱点
 
